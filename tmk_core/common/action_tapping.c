@@ -35,8 +35,7 @@ static uint8_t     waiting_buffer_tail                 = 0;
 static bool process_tapping(keyrecord_t *record);
 static bool waiting_buffer_enq(keyrecord_t record);
 static void waiting_buffer_clear(void);
-static bool waiting_buffer_typed(keyevent_t event);
-static bool waiting_buffer_has_anykey_pressed(void);
+static bool waiting_buffer_typed(keyevent_t *event);
 static void waiting_buffer_scan_tap(void);
 static void debug_tapping_key(void);
 static void debug_waiting_buffer(void);
@@ -55,7 +54,7 @@ void action_tapping_process(keyrecord_t record) {
     } else {
         if (!waiting_buffer_enq(record)) {
             // clear all in case of overflow.
-            debug("OVERFLOW: CLEAR ALL STATES\n");
+            //debug("OVERFLOW: CLEAR ALL STATES\n");
             clear_keyboard();
             waiting_buffer_clear();
             tapping_key = (keyrecord_t){};
@@ -95,15 +94,28 @@ bool process_tapping(keyrecord_t *keyp) {
     if (IS_TAPPING_PRESSED()) {
         if (WITHIN_TAPPING_TERM(event)) {
             if (tapping_key.tap.count == 0) {
+                action_t action = layer_switch_get_action(tapping_key.event.key);
+                uint8_t mods = (action.kind.id == ACT_LMODS_TAP) ?  action.key.mods :
+                                (action.kind.id == ACT_RMODS_TAP) ?  action.key.mods<<4 : 0;
+                uint8_t isShift = mods == MOD_BIT(KC_LSFT) || mods == MOD_BIT(KC_RSFT);
                 if (IS_TAPPING_KEY(event.key) && !event.pressed) {
-                    // first tap!
-                    debug("Tapping: First tap(0->1).\n");
-                    tapping_key.tap.count = 1;
-                    debug_tapping_key();
-                    process_record(&tapping_key);
+                    uint16_t dt = 0;
+                    for (uint8_t i = waiting_buffer_tail; i != waiting_buffer_head; i = (i + 1) % WAITING_BUFFER_SIZE) {
+                        if (waiting_buffer[i].event.pressed)
+                            dt = TIMER_DIFF_16(event.time, waiting_buffer[i].event.time);
+                    }
+                    if (dt > 50 && isShift) {
+                        debug("Tapping: waiting for finish of interrupt key.\n");
+                    } else {
+                        // first tap!
+                        debug("Tapping: First tap(0->1).\n");
+                        tapping_key.tap.count = 1;
+                        debug_tapping_key();
+                        process_record(&tapping_key);
 
-                    // copy tapping state
-                    keyp->tap = tapping_key.tap;
+                        // copy tapping state
+                        keyp->tap = tapping_key.tap;
+                    }
                     // enqueue
                     return false;
                 }
@@ -113,24 +125,49 @@ bool process_tapping(keyrecord_t *keyp) {
                  */
 #    if defined(TAPPING_TERM_PER_KEY) || (!defined(PER_KEY_TAPPING_TERM) && TAPPING_TERM >= 500) || defined(PERMISSIVE_HOLD)
 #        ifdef TAPPING_TERM_PER_KEY
-                else if ((get_tapping_term(get_event_keycode(tapping_key.event)) >= 500) && IS_RELEASED(event) && waiting_buffer_typed(event))
+                else if ((get_tapping_term(get_event_keycode(tapping_key.event)) >= 500) && IS_RELEASED(event) && waiting_buffer_typed(&event))
 #        else
-                else if (IS_RELEASED(event) && waiting_buffer_typed(event))
+                else if (IS_RELEASED(event) && waiting_buffer_typed(&event) && isShift)
 #        endif
                 {
-                    debug("Tapping: End. No tap. Interfered by typing key\n");
-                    process_record(&tapping_key);
-                    tapping_key = (keyrecord_t){};
-                    debug_tapping_key();
-                    // enqueue
-                    return false;
+                    if (waiting_buffer_typed(&tapping_key.event)) {
+                        debug("Tapping: End. Released interrupt after tap\n");
+                        uint16_t overlap = 0;
+                        uint16_t subseq_time = event.time;
+                        keyrecord_t *taprel = 0;
+                        for (uint8_t i = waiting_buffer_tail; i != waiting_buffer_head; i = (i + 1) % WAITING_BUFFER_SIZE) {
+                            //dprintf("EV %u\n", waiting_buffer[i].event.time);
+                            if (KEYEQ(waiting_buffer[i].event.key, event.key)) {
+                                overlap -= waiting_buffer[i].event.time;
+                                subseq_time -= waiting_buffer[i].event.time;
+                            } else if (KEYEQ(waiting_buffer[i].event.key, tapping_key.event.key)) {
+                                taprel = &waiting_buffer[i];
+                                overlap += waiting_buffer[i].event.time;
+                            }
+                        }
+                        dprintf("SUBS %u, OVERL %u\n", subseq_time, overlap);
+
+                        if ((float)overlap / (float)subseq_time < 0.65) {
+                            //debug("Tapping: tap due to overlap\n");
+                            tapping_key.tap.count = 1;
+                            taprel->tap = tapping_key.tap;
+                        }
+                    }
+//                    else {
+                        //debug("Tapping: End. No tap. Interfered by typing key\n");
+                        process_record(&tapping_key);
+                        tapping_key = (keyrecord_t){};
+                        debug_tapping_key();
+                        // enqueue
+                        return false;
+//                    }
                 }
 #    endif
                 /* Process release event of a key pressed before tapping starts
                  * Without this unexpected repeating will occur with having fast repeating setting
                  * https://github.com/tmk/tmk_keyboard/issues/60
                  */
-                else if (IS_RELEASED(event) && !waiting_buffer_typed(event)) {
+                else if (IS_RELEASED(event) && !waiting_buffer_typed(&event)) {
                     // Modifier should be retained till end of this tapping.
                     action_t action = layer_switch_get_action(event.key);
                     switch (action.kind.id) {
@@ -192,7 +229,7 @@ bool process_tapping(keyrecord_t *keyp) {
         }
         // after TAPPING_TERM
         else {
-            if (tapping_key.tap.count == 0) {
+            if (tapping_key.tap.count == 0 || waiting_buffer_typed(&tapping_key.event)) {
                 debug("Tapping: End. Timeout. Not tap(0): ");
                 debug_event(event);
                 debug("\n");
@@ -209,7 +246,7 @@ bool process_tapping(keyrecord_t *keyp) {
                     return true;
                 } else if (is_tap_key(event.key) && event.pressed) {
                     if (tapping_key.tap.count > 1) {
-                        debug("Tapping: Start new tap with releasing last timeout tap(>1).\n");
+                        //debug("Tapping: Start new tap with releasing last timeout tap(>1).\n");
                         // unregister key
                         process_record(&(keyrecord_t){.tap = tapping_key.tap, .event.key = tapping_key.event.key, .event.time = event.time, .event.pressed = false});
                     } else {
@@ -305,7 +342,7 @@ bool waiting_buffer_enq(keyrecord_t record) {
     }
 
     if ((waiting_buffer_head + 1) % WAITING_BUFFER_SIZE == waiting_buffer_tail) {
-        debug("waiting_buffer_enq: Over flow.\n");
+        //debug("waiting_buffer_enq: Over flow.\n");
         return false;
     }
 
@@ -330,22 +367,11 @@ void waiting_buffer_clear(void) {
  *
  * FIXME: Needs docs
  */
-bool waiting_buffer_typed(keyevent_t event) {
+bool waiting_buffer_typed(keyevent_t *event) {
     for (uint8_t i = waiting_buffer_tail; i != waiting_buffer_head; i = (i + 1) % WAITING_BUFFER_SIZE) {
-        if (KEYEQ(event.key, waiting_buffer[i].event.key) && event.pressed != waiting_buffer[i].event.pressed) {
+        if (KEYEQ(event->key, waiting_buffer[i].event.key) && event->pressed != waiting_buffer[i].event.pressed) {
             return true;
         }
-    }
-    return false;
-}
-
-/** \brief Waiting buffer has anykey pressed
- *
- * FIXME: Needs docs
- */
-__attribute__((unused)) bool waiting_buffer_has_anykey_pressed(void) {
-    for (uint8_t i = waiting_buffer_tail; i != waiting_buffer_head; i = (i + 1) % WAITING_BUFFER_SIZE) {
-        if (waiting_buffer[i].event.pressed) return true;
     }
     return false;
 }
